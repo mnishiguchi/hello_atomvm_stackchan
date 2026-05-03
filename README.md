@@ -4,7 +4,7 @@ SPDX-FileCopyrightText: 2026 piyopiyo.ex members
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# hello_atomvm_disterl_stackchan
+# Hello AtomVM Stack-chan
 
 [LovyanGFX](https://github.com/lovyan03/LovyanGFX) を組み込んだ専用の AtomVM イメージを使って、Stack-chan 風の顔アニメーションを表示するサンプルです。
 
@@ -12,14 +12,11 @@ SPDX-License-Identifier: Apache-2.0
 
 - AtomLGFX で液晶に顔を描画する
 - タッチ入力に応じて視線と口の開き具合を変える
-- 環境変数から Wi-Fi 情報を受け取って NVS に保存する
-- Wi-Fi 接続後に Distributed Erlang ノードを起動する
-- 別端末の IEx から表情や視線、口の開き具合を変更する
 
 現在は `mix atomvm.esp32.install` ではなく、このリポジトリーに含まれているカスタム AtomVM イメージを使ってください。
 
 <p align="center">
-  <img alt="lovyangfx" width="320" src="https://github.com/user-attachments/assets/47e24bd0-ea04-4f8e-bde6-708dc2fe6b35">
+  <img alt="atomvm-stackchan" width="320" src="https://github.com/user-attachments/assets/6a6f4bd0-20b8-4865-8186-50a9952da7ff">
 </p>
 
 ## 対象機材
@@ -36,7 +33,7 @@ SPDX-License-Identifier: Apache-2.0
 補足:
 
 - 顔表示のサンプル設定は `M5Stack Core2` 向けの AtomLGFX プリセットを使っています
-- 別の表示ハードウェアで動かす場合は、[`lib/sample_app/face_server.ex`](/home/mnishiguchi/Projects/atomvm/hello_atomvm_disterl_stackchan/lib/sample_app/face_server.ex) の open options を調整してください
+- 別の表示ハードウェアで動かす場合は、`lib/sample_app/face_server.ex` の open options を調整してください
 
 ## 対象開発環境
 
@@ -85,20 +82,6 @@ esptool --chip esp32s3 --port /dev/ttyACM0 erase-flash
 esptool --chip esp32s3 --port /dev/ttyACM0 write-flash 0x0 atomvm-esp32s3-elixir.img
 ```
 
-Wi-Fi と Distributed Erlang も使う場合は、アプリケーションを書き込む前に Wi-Fi 情報を設定します。
-Wi-Fi を使わずに顔表示だけを試す場合は、この手順を省略できます。
-
-```sh
-export ATOMVM_WIFI_SSID="your-ssid"
-export ATOMVM_WIFI_PASSPHRASE="your-passphrase"
-```
-
-必要に応じて、起動のたびに NVS 上の Wi-Fi 情報を上書きできます。
-
-```sh
-export ATOMVM_WIFI_FORCE=true
-```
-
 アプリケーションを書き込みます。
 
 ```sh
@@ -127,94 +110,3 @@ tio /dev/ttyACM0
 ```
 
 書き込み後、画面上で顔が動いて表示されれば成功です。
-
-Wi-Fi 情報を設定している場合は、あわせて Wi-Fi 接続と Distributed Erlang の起動ログも表示されます。
-
-例:
-
-```text
-wifi: first-time provision (stored Wi-Fi credentials in NVS)
-wifi: connected to AP
-wifi: got IP {{192,168,1,123},{255,255,255,0},{192,168,1,1}}
-disterl: started
-disterl: node :"piyopiyo@192.168.1.123"
-disterl: cookie <<"AtomVM">>
-disterl: registered process :disterl
-sntp: synced {tv_sec, tv_usec}
-```
-
-Wi-Fi 情報を設定せずに書き込んだ場合でも、顔表示そのものは動作します。
-その場合、Wi-Fi と Distributed Erlang は起動せず、シリアルログにその旨が表示されます。
-
-## リモート操作
-
-Wi-Fi と Distributed Erlang が起動していれば、別端末の IEx から顔を変更できます。
-
-まず、開発端末側で IEx をノード名付きで起動します。
-`YOUR_HOST_LAN_IP` には、ESP32 と同じネットワーク上の開発端末の IP アドレスを指定してください。
-
-```sh
-iex --name host@YOUR_HOST_LAN_IP --cookie AtomVM
-```
-
-次に IEx 上で ESP32 ノードへ接続します。
-`YOUR_ESP32_IP` には、シリアルログに表示された IP アドレスを指定してください。
-
-```elixir
-device = :"piyopiyo@YOUR_ESP32_IP"
-
-Node.connect(device)
-Node.list(:connected)
-
-:erpc.call(device, SampleApp.DistErl, :hello, [])
-:erpc.call(device, SampleApp.DistErl, :set_expression, [:happy])
-:erpc.call(device, SampleApp.DistErl, :set_gaze, [0.8, -0.4])
-:erpc.call(device, SampleApp.DistErl, :set_mouth_open, [0.9])
-:erpc.call(device, SampleApp.DistErl, :get_face_state, [])
-send({:disterl, device}, :demo_message)
-```
-
-期待される動作:
-
-- `Node.connect(device)` が `true` を返す
-- `Node.list(:connected)` に `device` が含まれる
-- `:erpc.call(device, SampleApp.DistErl, :hello, [])` が `{:hello_from_atomvm, :"piyopiyo@192.168.1.123"}` のような値を返す
-- `send({:disterl, device}, :demo_message)` により ESP32 側で `disterl: received :demo_message` が表示される
-
-表情には次を指定できます。
-
-- `:neutral`
-- `:happy`
-- `:angry`
-- `:sad`
-- `:doubt`
-- `:sleepy`
-
-## Wi-Fi プロビジョニング
-
-Wi-Fi 情報は起動時に NVS へ保存され、次回以降の起動でも再利用されます。
-
-### 環境変数
-
-| 環境変数 | NVS キー | 説明 |
-| -------- | -------- | ---- |
-| `ATOMVM_WIFI_SSID` | `wifi_ssid` | 保存する Wi-Fi SSID |
-| `ATOMVM_WIFI_PASSPHRASE` | `wifi_passphrase` | 保存する Wi-Fi パスフレーズ。オープンネットワークでは省略可 |
-| `ATOMVM_WIFI_FORCE` | — | 設定されていると、起動時に認証情報を上書きする |
-
-### 挙動
-
-- 初回起動時
-  - `ATOMVM_WIFI_SSID` が設定されていれば NVS に保存される
-- 2 回目以降の起動
-  - NVS に保存済みの情報を再利用する
-- `ATOMVM_WIFI_FORCE` を設定した場合
-  - 起動のたびに NVS の認証情報を上書きする
-  - パスフレーズ未指定で上書きすると、既存のパスフレーズは削除される
-
-## 参考情報
-
-- AtomVM Distributed Erlang guide
-  - https://doc.atomvm.org/main/distributed-erlang.html
-- AtomVM Getting Started Guide
-  - https://doc.atomvm.org/main/getting-started-guide.html

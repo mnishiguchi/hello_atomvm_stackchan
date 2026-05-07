@@ -12,38 +12,40 @@ defmodule SampleApp.FaceServer do
   @default_expression :neutral
   @expression_order [:neutral, :happy, :angry, :sad, :doubt, :sleepy]
 
-  @frame_ms 50
+  @touch_ms 10
+  @frame_ms 500
+  @min_render_ms 16
   @expression_interval_ms 10_000
 
-  @touch_center_x 160.0
-  @touch_center_y 120.0
+  @display_rotation 1
+  @touch_mouth_open 1.0
 
   @sample_open_options [
-    board_preset: :m5stack_core2,
-    panel_driver: :ili9342c,
+    panel_driver: :ili9488,
     width: 320,
-    height: 240,
-    offset_rotation: 3,
+    height: 480,
+    offset_rotation: 0,
     readable: false,
-    invert: true,
+    invert: false,
     rgb_order: false,
     dlen_16bit: false,
-    lcd_spi_host: :spi2_host,
-    spi_sclk_gpio: 18,
-    spi_mosi_gpio: 23,
-    spi_miso_gpio: 38,
-    lcd_cs_gpio: 5,
-    lcd_dc_gpio: 15,
-    lcd_rst_gpio: -1,
-    touch_driver: :ft6336u,
-    touch_i2c_port: 0,
-    touch_i2c_addr: 0x38,
-    touch_sda_gpio: 21,
-    touch_scl_gpio: 22,
-    touch_irq_gpio: 39,
     lcd_spi_mode: 0,
+    lcd_freq_write_hz: 20_000_000,
+    lcd_freq_read_hz: 10_000_000,
     lcd_bus_shared: true,
-    touch_bus_shared: true
+    touch_bus_shared: true,
+    lcd_spi_host: :spi2_host,
+    spi_sclk_gpio: 7,
+    spi_mosi_gpio: 9,
+    spi_miso_gpio: 8,
+    lcd_cs_gpio: 43,
+    lcd_dc_gpio: 3,
+    lcd_rst_gpio: 2,
+    touch_driver: :xpt2046,
+    touch_cs_gpio: 44,
+    touch_irq_gpio: -1,
+    touch_spi_host: :spi2_host,
+    touch_spi_freq_hz: 1_000_000
   ]
 
   def start_link(open_options \\ []) do
@@ -76,9 +78,16 @@ defmodule SampleApp.FaceServer do
         log_info("AtomLGFX opened open_options=#{inspect(effective_open_options)}")
 
         case initialize_face(port) do
-          {:ok, face} ->
-            log_info("Stack-chan started")
-            schedule_tick()
+          {:ok, face, touch_enabled} ->
+            log_info(
+              "Stack-chan started viewport=#{face.display_width}x#{face.display_height} touch=#{touch_enabled}"
+            )
+
+            if touch_enabled do
+              schedule_touch()
+            end
+
+            schedule_frame(0)
 
             {:ok,
              %{
@@ -86,7 +95,13 @@ defmodule SampleApp.FaceServer do
                face: face,
                expression_index: expression_index(@default_expression),
                last_expression_change_ms: monotonic_ms(),
-               remote_mouth_open: nil
+               remote_mouth_open: nil,
+               touch_enabled: touch_enabled,
+               touch_active: false,
+               touch_center_x: face.display_width / 2.0,
+               touch_center_y: face.display_height / 2.0,
+               render_requested: false,
+               last_render_ms: 0
              }}
 
           {:error, reason} ->
@@ -97,21 +112,25 @@ defmodule SampleApp.FaceServer do
       {:error, reason} ->
         log_failure("AtomLGFX open failed", reason)
         {:stop, {:atomlgfx_open_failed, reason}}
-      end
+    end
   end
 
   @impl GenServer
   def handle_call({:set_expression, expression}, _from, state) do
     if expression in @expression_order do
+      now_ms = monotonic_ms()
       updated_face = Face.set_expression(state.face, expression)
 
-      {:reply, :ok,
-       %{
-         state
-         | face: updated_face,
-           expression_index: expression_index(expression),
-           last_expression_change_ms: monotonic_ms()
-       }}
+      next_state =
+        %{
+          state
+          | face: updated_face,
+            expression_index: expression_index(expression),
+            last_expression_change_ms: now_ms
+        }
+        |> request_render(now_ms)
+
+      {:reply, :ok, next_state}
     else
       {:reply, {:error, {:unsupported_expression, expression}}, state}
     end
@@ -119,8 +138,13 @@ defmodule SampleApp.FaceServer do
 
   def handle_call({:set_gaze, horizontal, vertical}, _from, state)
       when is_number(horizontal) and is_number(vertical) do
-    updated_face = Face.set_gaze(state.face, horizontal, vertical)
-    {:reply, :ok, %{state | face: updated_face}}
+    now_ms = monotonic_ms()
+
+    next_state =
+      %{state | face: Face.set_gaze(state.face, horizontal, vertical)}
+      |> request_render(now_ms)
+
+    {:reply, :ok, next_state}
   end
 
   def handle_call({:set_gaze, horizontal, vertical}, _from, state) do
@@ -128,9 +152,18 @@ defmodule SampleApp.FaceServer do
   end
 
   def handle_call({:set_mouth_open, ratio}, _from, state) when is_number(ratio) do
+    now_ms = monotonic_ms()
     normalized_ratio = clamp(ratio * 1.0, 0.0, 1.0)
-    updated_face = Face.set_mouth_open(state.face, normalized_ratio)
-    {:reply, :ok, %{state | face: updated_face, remote_mouth_open: normalized_ratio}}
+
+    next_state =
+      %{
+        state
+        | face: Face.set_mouth_open(state.face, normalized_ratio),
+          remote_mouth_open: normalized_ratio
+      }
+      |> request_render(now_ms)
+
+    {:reply, :ok, next_state}
   end
 
   def handle_call({:set_mouth_open, ratio}, _from, state) do
@@ -146,29 +179,43 @@ defmodule SampleApp.FaceServer do
        gaze_h: face.gaze_h,
        gaze_v: face.gaze_v,
        mouth_open: face.mouth_open,
-       remote_mouth_open: state.remote_mouth_open
+       remote_mouth_open: state.remote_mouth_open,
+       touch_enabled: state.touch_enabled,
+       touch_active: state.touch_active
      }, state}
   end
 
   @impl GenServer
-  def handle_info(:tick, state) do
-    now_ms = monotonic_ms()
+  def handle_info(:touch_tick, %{touch_enabled: false} = state) do
+    {:noreply, state}
+  end
 
-    next_state =
-      state
-      |> handle_touch()
-      |> maybe_rotate_expression(now_ms)
-      |> update_face(now_ms)
+  def handle_info(:touch_tick, state) do
+    {next_state, mouth_changed} = handle_touch(state)
 
-    case Face.draw(next_state.face, next_state.port) do
-      :ok ->
-        schedule_tick()
-        {:noreply, next_state}
-
-      {:error, reason} ->
-        log_failure("face_draw failed", reason)
-        {:stop, {:face_draw_failed, reason}, next_state}
+    if next_state.touch_enabled do
+      schedule_touch()
     end
+
+    if mouth_changed do
+      draw_mouth_or_stop(next_state)
+    else
+      {:noreply, next_state}
+    end
+  end
+
+  def handle_info(:frame_tick, %{touch_active: true} = state) do
+    schedule_frame(@frame_ms)
+    {:noreply, state}
+  end
+
+  def handle_info(:frame_tick, state) do
+    schedule_frame(@frame_ms)
+    render_or_stop(state, monotonic_ms())
+  end
+
+  def handle_info(:render_now, state) do
+    render_or_stop(state, monotonic_ms())
   end
 
   @impl GenServer
@@ -180,14 +227,19 @@ defmodule SampleApp.FaceServer do
   defp initialize_face(port) do
     with :ok <- step("ping", AtomLGFX.ping(port)),
          :ok <- step("init", AtomLGFX.init(port)),
-         :ok <- step("set_rotation", AtomLGFX.set_rotation(port, 1)),
+         :ok <- step("set_rotation", AtomLGFX.set_rotation(port, @display_rotation)),
+         {:ok, display_width} <- step_value("width", AtomLGFX.width(port)),
+         {:ok, display_height} <- step_value("height", AtomLGFX.height(port)),
+         {:ok, touch_enabled} <- detect_touch(port),
          :ok <- step("set_swap_bytes_lcd", AtomLGFX.set_swap_bytes(port, true, 0)) do
       face0 =
-        Face.new(display_width: 320, display_height: 240)
+        Face.new(display_width: display_width, display_height: display_height)
         |> Face.set_expression(@default_expression)
 
       case Face.init(face0, port) do
-        {:ok, face} -> {:ok, face}
+        {:ok, face} ->
+          {:ok, face, touch_enabled}
+
         {:error, reason} = err ->
           log_failure("face_init failed", reason)
           err
@@ -198,22 +250,73 @@ defmodule SampleApp.FaceServer do
   defp handle_touch(state) do
     case AtomLGFX.get_touch(state.port) do
       {:ok, {touch_x, touch_y, _size}} ->
-        gaze_h = clamp((touch_x - @touch_center_x) / @touch_center_x, -1.0, 1.0)
-        gaze_v = clamp((touch_y - @touch_center_y) / @touch_center_y, -1.0, 1.0)
+        gaze_h = clamp((touch_x - state.touch_center_x) / state.touch_center_x, -1.0, 1.0)
+        gaze_v = clamp((touch_y - state.touch_center_y) / state.touch_center_y, -1.0, 1.0)
 
         updated_face =
           state.face
           |> Face.set_gaze(gaze_h, gaze_v)
-          |> Face.set_mouth_open(0.7)
+          |> Face.set_mouth_open(@touch_mouth_open)
 
-        %{state | face: updated_face}
+        {%{state | face: updated_face, touch_active: true}, not state.touch_active}
 
       {:ok, :none} ->
-        %{state | face: Face.set_mouth_open(state.face, effective_mouth_open(state))}
+        updated_face = Face.set_mouth_open(state.face, effective_mouth_open(state))
+        {%{state | face: updated_face, touch_active: false}, state.touch_active}
 
       {:error, reason} ->
-        log_failure("get_touch failed", reason)
+        log_failure("get_touch failed; disabling touch polling", reason)
+        {%{state | touch_enabled: false, touch_active: false}, false}
+    end
+  end
+
+  defp render_or_stop(state, now_ms) do
+    if now_ms - state.last_render_ms < @min_render_ms do
+      {:noreply, %{state | render_requested: false}}
+    else
+      next_state =
         state
+        |> maybe_rotate_expression(now_ms)
+        |> update_face(now_ms)
+
+      case Face.draw(next_state.face, next_state.port) do
+        :ok ->
+          {:noreply,
+           %{
+             next_state
+             | render_requested: false,
+               last_render_ms: now_ms
+           }}
+
+        {:error, reason} ->
+          log_failure("face_draw failed", reason)
+          {:stop, {:face_draw_failed, reason}, next_state}
+      end
+    end
+  end
+
+  defp draw_mouth_or_stop(state) do
+    case Face.draw_mouth_overlay(state.face, state.port) do
+      :ok ->
+        {:noreply, state}
+
+      {:error, reason} ->
+        log_failure("mouth_overlay_draw failed", reason)
+        {:stop, {:mouth_overlay_draw_failed, reason}, state}
+    end
+  end
+
+  defp request_render(state, now_ms) do
+    cond do
+      state.render_requested ->
+        state
+
+      now_ms - state.last_render_ms < @min_render_ms ->
+        state
+
+      true ->
+        send(self(), :render_now)
+        %{state | render_requested: true}
     end
   end
 
@@ -242,8 +345,12 @@ defmodule SampleApp.FaceServer do
     %{state | face: Face.update(state.face, now_ms)}
   end
 
-  defp schedule_tick do
-    Process.send_after(self(), :tick, @frame_ms)
+  defp schedule_touch do
+    Process.send_after(self(), :touch_tick, @touch_ms)
+  end
+
+  defp schedule_frame(delay_ms) do
+    Process.send_after(self(), :frame_tick, delay_ms)
   end
 
   defp expression_index(:neutral), do: 0
@@ -288,6 +395,28 @@ defmodule SampleApp.FaceServer do
   defp step(_label, {:error, reason} = err) do
     log_failure("AtomLGFX step failed", reason)
     err
+  end
+
+  defp step_value(label, {:ok, value}) do
+    log_info("#{label} ok value=#{inspect(value)}")
+    {:ok, value}
+  end
+
+  defp step_value(_label, {:error, reason} = err) do
+    log_failure("AtomLGFX step failed", reason)
+    err
+  end
+
+  defp detect_touch(port) do
+    case AtomLGFX.supports_touch?(port) do
+      {:ok, touch_enabled} ->
+        log_info("supports_touch ok value=#{inspect(touch_enabled)}")
+        {:ok, touch_enabled}
+
+      {:error, reason} = err ->
+        log_failure("supports_touch failed", reason)
+        err
+    end
   end
 
   defp log_info(message) when is_binary(message) do

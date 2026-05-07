@@ -16,7 +16,7 @@ SPDX-License-Identifier: Apache-2.0
 現在は `mix atomvm.esp32.install` ではなく、このリポジトリーに含まれているカスタム AtomVM イメージを使ってください。
 
 <p align="center">
-  <img alt="atomvm-stackchan" width="320" src="https://github.com/user-attachments/assets/6a6f4bd0-20b8-4865-8186-50a9952da7ff">
+  <img alt="atomvm-stackchan" width="320" src="https://github.com/user-attachments/assets/47e24bd0-ea04-4f8e-bde6-708dc2fe6b35">
 </p>
 
 ## 対象機材
@@ -32,8 +32,8 @@ SPDX-License-Identifier: Apache-2.0
 
 補足:
 
-- 顔表示のサンプル設定は `M5Stack Core2` 向けの AtomLGFX プリセットを使っています
-- 別の表示ハードウェアで動かす場合は、`lib/sample_app/face_server.ex` の open options を調整してください
+- 顔表示の既定設定は `piyopiyo-pcb` の `ESP32-S3 + ILI9488 + XPT2046` を想定しています
+- `piyopiyo-pcb` の `v1.6` 以降は `lcd_cs_gpio: 4` 。`v1.5` 以前は `lcd_cs_gpio: 43`。
 
 ## 対象開発環境
 

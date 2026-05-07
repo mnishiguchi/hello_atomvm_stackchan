@@ -7,9 +7,11 @@ defmodule SampleApp.Face do
 
   import Bitwise
 
+  alias AtomLGFX.BinaryBatch
+
   @canvas_width 320
   @canvas_height 240
-  @sprite_depth 4
+  @sprite_depth 2
   @sprite_target 1
 
   @eye_r 8
@@ -37,10 +39,15 @@ defmodule SampleApp.Face do
   @palette_sweat 2
   @palette_heart 3
 
+  @rgb565_bg 0xFFB7
+  @rgb565_fg 0x0000
+
+  @mouth_dirty_x 108
+  @mouth_dirty_y 108
+  @mouth_dirty_w 112
+  @mouth_dirty_h 86
+
   @col_bg {:index, @palette_bg}
-  @col_pr {:index, @palette_fg}
-  @col_sweat {:index, @palette_sweat}
-  @col_heart {:index, @palette_heart}
 
   @external_gaze_hold_ms 1_500
 
@@ -175,15 +182,42 @@ defmodule SampleApp.Face do
     breath_offset = min(1.0, face.breath)
     by = trunc(breath_offset * 3)
 
-    with :ok <- AtomLGFX.fill_screen(port, @col_bg, @sprite_target),
-         :ok <- draw_mouth(port, face, @mouth_x, @mouth_y + by),
-         :ok <- draw_eye(port, face, @eye_r_x, @eye_r_y + by, face.eye_open_r, false),
-         :ok <- draw_eye(port, face, @eye_l_x, @eye_l_y + by, face.eye_open_l, true),
-         :ok <- maybe_draw_eyebrows(port, face, by),
-         :ok <- draw_effect(port, face, breath_offset),
-         :ok <- AtomLGFX.push_sprite(port, @sprite_target, face.push_x, face.push_y) do
-      :ok
-    end
+    commands = [
+      BinaryBatch.target(@sprite_target),
+      BinaryBatch.color_mode(:palette_index),
+      BinaryBatch.fill_screen(@palette_bg),
+      draw_mouth(face, @mouth_x, @mouth_y + by),
+      draw_eye(face, @eye_r_x, @eye_r_y + by, face.eye_open_r, false),
+      draw_eye(face, @eye_l_x, @eye_l_y + by, face.eye_open_l, true),
+      maybe_draw_eyebrows(face, by),
+      draw_effect(face, breath_offset),
+      BinaryBatch.target(0),
+      BinaryBatch.push_sprite(@sprite_target, face.push_x, face.push_y),
+      BinaryBatch.display()
+    ]
+
+    BinaryBatch.render(port, commands)
+  end
+
+  def draw_mouth_overlay(%__MODULE__{} = face, port) do
+    breath_offset = min(1.0, face.breath)
+    by = trunc(breath_offset * 3)
+
+    commands = [
+      BinaryBatch.target(0),
+      BinaryBatch.color_mode(:rgb565),
+      BinaryBatch.fill_rect(
+        face.push_x + @mouth_dirty_x,
+        face.push_y + @mouth_dirty_y,
+        @mouth_dirty_w,
+        @mouth_dirty_h,
+        @rgb565_bg
+      ),
+      draw_mouth_rgb565(face, face.push_x + @mouth_x, face.push_y + @mouth_y + by),
+      BinaryBatch.display()
+    ]
+
+    BinaryBatch.render(port, commands)
   end
 
   defp centered_push_position(display_width, display_height) do
@@ -200,101 +234,105 @@ defmodule SampleApp.Face do
 
   defp center_offset(_outer_size, _inner_size), do: 0
 
-  defp draw_eye(port, face, x, y, open_ratio, is_left) do
+  defp draw_eye(face, x, y, open_ratio, is_left) do
     offset_x = trunc(face.gaze_h * 3)
     offset_y = trunc(face.gaze_v * 3)
     eye_x = x + offset_x
     eye_y = y + offset_y
 
     if open_ratio > 0.0 do
-      with :ok <- AtomLGFX.fill_circle(port, eye_x, eye_y, @eye_r, @col_pr, @sprite_target),
-           :ok <- maybe_apply_angry_sad_mask(port, face, eye_x, eye_y, is_left),
-           :ok <- maybe_apply_happy_sleepy_mask(port, face, eye_x, eye_y) do
-        :ok
-      end
+      [
+        BinaryBatch.fill_circle(eye_x, eye_y, @eye_r, @palette_fg),
+        maybe_apply_angry_sad_mask(face, eye_x, eye_y, is_left),
+        maybe_apply_happy_sleepy_mask(face, eye_x, eye_y)
+      ]
     else
-      AtomLGFX.fill_rect(
-        port,
+      BinaryBatch.fill_rect(
         x - @eye_r + offset_x,
         y - 2 + offset_y,
         @eye_r * 2,
         4,
-        @col_pr,
-        @sprite_target
+        @palette_fg
       )
     end
   end
 
-  defp maybe_apply_angry_sad_mask(port, face, eye_x, eye_y, is_left) do
+  defp maybe_apply_angry_sad_mask(face, eye_x, eye_y, is_left) do
     if face.expr in [:angry, :sad] do
       x0 = eye_x - @eye_r
       y0 = eye_y - @eye_r
       x1 = x0 + @eye_r * 2
       y1 = y0
-      x2 = if(not is_left != not (face.expr == :sad), do: x0, else: x1)
+      sad_expression = face.expr == :sad
+      x2 = if((not is_left) != (not sad_expression), do: x0, else: x1)
       y2 = y0 + @eye_r
 
-      AtomLGFX.fill_triangle(port, x0, y0, x1, y1, x2, y2, @col_bg, @sprite_target)
+      BinaryBatch.fill_triangle(x0, y0, x1, y1, x2, y2, @palette_bg)
     else
-      :ok
+      []
     end
   end
 
-  defp maybe_apply_happy_sleepy_mask(port, face, eye_x, eye_y) do
+  defp maybe_apply_happy_sleepy_mask(face, eye_x, eye_y) do
     if face.expr in [:happy, :sleepy] do
       rx = eye_x - @eye_r
       ry = eye_y - @eye_r
       rw = @eye_r * 2 + 4
       rh = @eye_r + 2
 
-      with :ok <- maybe_happy_eye_inner_circle(port, face.expr, eye_x, eye_y),
-           :ok <-
-             AtomLGFX.fill_rect(
-               port,
-               rx,
-               if(face.expr == :happy, do: ry + @eye_r, else: ry),
-               rw,
-               rh,
-               @col_bg,
-               @sprite_target
-             ) do
-        :ok
-      end
+      [
+        maybe_happy_eye_inner_circle(face.expr, eye_x, eye_y),
+        BinaryBatch.fill_rect(
+          rx,
+          if(face.expr == :happy, do: ry + @eye_r, else: ry),
+          rw,
+          rh,
+          @palette_bg
+        )
+      ]
     else
-      :ok
+      []
     end
   end
 
-  defp maybe_happy_eye_inner_circle(_port, expr, _eye_x, _eye_y) when expr != :happy,
-    do: :ok
+  defp maybe_happy_eye_inner_circle(expr, _eye_x, _eye_y) when expr != :happy,
+    do: []
 
-  defp maybe_happy_eye_inner_circle(port, :happy, eye_x, eye_y) do
-    AtomLGFX.fill_circle(port, eye_x, eye_y, trunc(@eye_r / 1.5), @col_bg, @sprite_target)
+  defp maybe_happy_eye_inner_circle(:happy, eye_x, eye_y) do
+    BinaryBatch.fill_circle(eye_x, eye_y, trunc(@eye_r / 1.5), @palette_bg)
   end
 
-  defp draw_mouth(port, face, cx, cy) do
+  defp draw_mouth(face, cx, cy) do
     open_ratio = face.mouth_open
     h = @mouth_min_h + trunc((@mouth_max_h - @mouth_min_h) * open_ratio)
     w = @mouth_min_w + trunc((@mouth_max_w - @mouth_min_w) * (1.0 - open_ratio))
     x = cx - div(w, 2)
     y = cy - div(h, 2) + trunc(face.breath * 2)
 
-    AtomLGFX.fill_rect(port, x, y, w, h, @col_pr, @sprite_target)
+    BinaryBatch.fill_rect(x, y, w, h, @palette_fg)
   end
 
-  defp maybe_draw_eyebrows(_port, _face, _by) when @brow_h <= 0, do: :ok
+  defp draw_mouth_rgb565(face, cx, cy) do
+    open_ratio = face.mouth_open
+    h = @mouth_min_h + trunc((@mouth_max_h - @mouth_min_h) * open_ratio)
+    w = @mouth_min_w + trunc((@mouth_max_w - @mouth_min_w) * (1.0 - open_ratio))
+    x = cx - div(w, 2)
+    y = cy - div(h, 2) + trunc(face.breath * 2)
 
-  defp maybe_draw_eyebrows(port, face, by) do
-    with :ok <- draw_eyebrow(port, face, @brow_r_x, @brow_r_y + by, false),
-         :ok <- draw_eyebrow(port, face, @brow_l_x, @brow_l_y + by, true) do
-      :ok
+    BinaryBatch.fill_rect(x, y, w, h, @rgb565_fg)
+  end
+
+  if @brow_w <= 0 or @brow_h <= 0 do
+    defp maybe_draw_eyebrows(_face, _by), do: []
+  else
+    defp maybe_draw_eyebrows(face, by) do
+      [
+        draw_eyebrow(face, @brow_r_x, @brow_r_y + by, false),
+        draw_eyebrow(face, @brow_l_x, @brow_l_y + by, true)
+      ]
     end
-  end
 
-  defp draw_eyebrow(port, face, x, y, is_left) do
-    if @brow_w == 0 or @brow_h == 0 do
-      :ok
-    else
+    defp draw_eyebrow(face, x, y, is_left) do
       if face.expr in [:angry, :sad] do
         a = if(is_left != (face.expr == :sad), do: -1, else: 1)
         dx = a * 3
@@ -308,199 +346,176 @@ defmodule SampleApp.Face do
         y3 = y - div(@brow_h, 2) + dy
         y4 = y + div(@brow_h, 2) + dy
 
-        with :ok <-
-               AtomLGFX.fill_triangle(port, x1, y1, x2, y2, x3, y3, @col_pr, @sprite_target),
-             :ok <-
-               AtomLGFX.fill_triangle(port, x2, y2, x3, y3, x4, y4, @col_pr, @sprite_target) do
-          :ok
-        end
+        [
+          BinaryBatch.fill_triangle(x1, y1, x2, y2, x3, y3, @palette_fg),
+          BinaryBatch.fill_triangle(x2, y2, x3, y3, x4, y4, @palette_fg)
+        ]
       else
         bx = x - div(@brow_w, 2)
         by = y - div(@brow_h, 2)
 
-        AtomLGFX.fill_rect(
-          port,
+        BinaryBatch.fill_rect(
           bx,
           if(face.expr == :happy, do: by - 5, else: by),
           @brow_w,
           @brow_h,
-          @col_pr,
-          @sprite_target
+          @palette_fg
         )
       end
     end
   end
 
-  defp draw_effect(port, face, offset) do
+  defp draw_effect(face, offset) do
     case face.expr do
       :doubt ->
-        draw_sweat_mark(port, 290, 110, 7, -offset)
+        draw_sweat_mark(290, 110, 7, -offset)
 
       :angry ->
-        draw_anger_mark(port, 280, 50, 12, offset)
+        draw_anger_mark(280, 50, 12, offset)
 
       :happy ->
-        draw_heart_mark(port, 280, 50, 12, offset)
+        draw_heart_mark(280, 50, 12, offset)
 
       :sad ->
-        draw_chill_mark(port, 270, 0, 30, offset)
+        draw_chill_mark(270, 0, 30, offset)
 
       :sleepy ->
-        with :ok <- draw_bubble_mark(port, 290, 40, 10, offset),
-             :ok <- draw_bubble_mark(port, 270, 52, 6, -offset) do
-          :ok
-        end
+        [
+          draw_bubble_mark(290, 40, 10, offset),
+          draw_bubble_mark(270, 52, 6, -offset)
+        ]
 
       :neutral ->
-        :ok
+        []
     end
   end
 
-  defp draw_sweat_mark(port, x, y, r, offset) do
+  defp draw_sweat_mark(x, y, r, offset) do
     y1 = y + trunc(5 * offset)
     r1 = r + trunc(r * 0.2 * offset)
 
     if r1 < 1 do
-      :ok
+      []
     else
       a = trunc(:math.sqrt(3.0) * r1 / 2.0)
 
-      with :ok <- AtomLGFX.fill_circle(port, x, y1, r1, @col_sweat, @sprite_target),
-           :ok <-
-             AtomLGFX.fill_triangle(
-               port,
-               x,
-               y1 - r1 * 2,
-               x - a,
-               y1 - div(r1, 2),
-               x + a,
-               y1 - div(r1, 2),
-               @col_sweat,
-               @sprite_target
-             ) do
-        :ok
-      end
+      [
+        BinaryBatch.fill_circle(x, y1, r1, @palette_sweat),
+        BinaryBatch.fill_triangle(
+          x,
+          y1 - r1 * 2,
+          x - a,
+          y1 - div(r1, 2),
+          x + a,
+          y1 - div(r1, 2),
+          @palette_sweat
+        )
+      ]
     end
   end
 
-  defp draw_anger_mark(port, x, y, r, offset) do
+  defp draw_anger_mark(x, y, r, offset) do
     r1 = r + abs(trunc(r * 0.4 * offset))
 
-    with :ok <-
-           AtomLGFX.fill_rect(
-             port,
-             x - div(r1, 3),
-             y - r1,
-             div(r1 * 2, 3),
-             r1 * 2,
-             @col_pr,
-             @sprite_target
-           ),
-         :ok <-
-           AtomLGFX.fill_rect(
-             port,
-             x - r1,
-             y - div(r1, 3),
-             r1 * 2,
-             div(r1 * 2, 3),
-             @col_pr,
-             @sprite_target
-           ),
-         :ok <-
-           AtomLGFX.fill_rect(
-             port,
-             x - div(r1, 3) + 2,
-             y - r1,
-             max(div(r1 * 2, 3) - 4, 0),
-             r1 * 2,
-             @col_bg,
-             @sprite_target
-           ),
-         :ok <-
-           AtomLGFX.fill_rect(
-             port,
-             x - r1,
-             y - div(r1, 3) + 2,
-             r1 * 2,
-             max(div(r1 * 2, 3) - 4, 0),
-             @col_bg,
-             @sprite_target
-           ) do
-      :ok
-    end
+    [
+      BinaryBatch.fill_rect(
+        x - div(r1, 3),
+        y - r1,
+        div(r1 * 2, 3),
+        r1 * 2,
+        @palette_fg
+      ),
+      BinaryBatch.fill_rect(
+        x - r1,
+        y - div(r1, 3),
+        r1 * 2,
+        div(r1 * 2, 3),
+        @palette_fg
+      ),
+      maybe_fill_rect(
+        x - div(r1, 3) + 2,
+        y - r1,
+        max(div(r1 * 2, 3) - 4, 0),
+        r1 * 2,
+        @palette_bg
+      ),
+      maybe_fill_rect(
+        x - r1,
+        y - div(r1, 3) + 2,
+        r1 * 2,
+        max(div(r1 * 2, 3) - 4, 0),
+        @palette_bg
+      )
+    ]
   end
 
-  defp draw_heart_mark(port, x, y, r, offset) do
+  defp draw_heart_mark(x, y, r, offset) do
     r1 = r + trunc(r * 0.4 * offset)
 
     if r1 < 2 do
-      :ok
+      []
     else
       a = :math.sqrt(2.0) * r1 / 4.0
       a_i = trunc(a)
 
-      with :ok <-
-             AtomLGFX.fill_circle(port, x - div(r1, 2), y, div(r1, 2), @col_heart, @sprite_target),
-           :ok <-
-             AtomLGFX.fill_circle(port, x + div(r1, 2), y, div(r1, 2), @col_heart, @sprite_target),
-           :ok <-
-             AtomLGFX.fill_triangle(
-               port,
-               x,
-               y,
-               x - div(r1, 2) - a_i,
-               y + a_i,
-               x + div(r1, 2) + a_i,
-               y + a_i,
-               @col_heart,
-               @sprite_target
-             ),
-           :ok <-
-             AtomLGFX.fill_triangle(
-               port,
-               x,
-               y + div(r1, 2) + trunc(2 * a),
-               x - div(r1, 2) - a_i,
-               y + a_i,
-               x + div(r1, 2) + a_i,
-               y + a_i,
-               @col_heart,
-               @sprite_target
-             ) do
-        :ok
-      end
+      [
+        BinaryBatch.fill_circle(x - div(r1, 2), y, div(r1, 2), @palette_heart),
+        BinaryBatch.fill_circle(x + div(r1, 2), y, div(r1, 2), @palette_heart),
+        BinaryBatch.fill_triangle(
+          x,
+          y,
+          x - div(r1, 2) - a_i,
+          y + a_i,
+          x + div(r1, 2) + a_i,
+          y + a_i,
+          @palette_heart
+        ),
+        BinaryBatch.fill_triangle(
+          x,
+          y + div(r1, 2) + trunc(2 * a),
+          x - div(r1, 2) - a_i,
+          y + a_i,
+          x + div(r1, 2) + a_i,
+          y + a_i,
+          @palette_heart
+        )
+      ]
     end
   end
 
-  defp draw_chill_mark(port, x, y, r, offset) do
+  defp draw_chill_mark(x, y, r, offset) do
     h = r + abs(trunc(r * 0.2 * offset))
 
-    with :ok <- AtomLGFX.fill_rect(port, x - div(r, 2), y, 3, div(h, 2), @col_pr, @sprite_target),
-         :ok <- AtomLGFX.fill_rect(port, x, y, 3, div(h * 3, 4), @col_pr, @sprite_target),
-         :ok <- AtomLGFX.fill_rect(port, x + div(r, 2), y, 3, h, @col_pr, @sprite_target) do
-      :ok
-    end
+    [
+      BinaryBatch.fill_rect(x - div(r, 2), y, 3, div(h, 2), @palette_fg),
+      BinaryBatch.fill_rect(x, y, 3, div(h * 3, 4), @palette_fg),
+      BinaryBatch.fill_rect(x + div(r, 2), y, 3, h, @palette_fg)
+    ]
   end
 
-  defp draw_bubble_mark(port, x, y, r, offset) do
+  defp draw_bubble_mark(x, y, r, offset) do
     r1 = r + trunc(r * 0.2 * offset)
 
     if r1 < 1 do
-      :ok
+      []
     else
-      with :ok <- AtomLGFX.draw_circle(port, x, y, r1, @col_pr, @sprite_target),
-           :ok <-
-             AtomLGFX.draw_circle(
-               port,
-               x - div(r1, 4),
-               y - div(r1, 4),
-               div(r1, 4),
-               @col_pr,
-               @sprite_target
-             ) do
-        :ok
-      end
+      [
+        BinaryBatch.draw_circle(x, y, r1, @palette_fg),
+        BinaryBatch.draw_circle(
+          x - div(r1, 4),
+          y - div(r1, 4),
+          div(r1, 4),
+          @palette_fg
+        )
+      ]
     end
+  end
+
+  defp maybe_fill_rect(_x, _y, width, _height, _color) when width < 1, do: []
+  defp maybe_fill_rect(_x, _y, _width, height, _color) when height < 1, do: []
+
+  defp maybe_fill_rect(x, y, width, height, color) do
+    BinaryBatch.fill_rect(x, y, width, height, color)
   end
 
   defp update_breath(face) do

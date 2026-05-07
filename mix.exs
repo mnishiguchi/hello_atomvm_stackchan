@@ -26,7 +26,7 @@ defmodule SampleApp.MixProject do
   defp deps do
     [
       {:exatomvm, github: "atomvm/exatomvm"},
-      {:atomlgfx, github: "mnishiguchi/atomlgfx", branch: "v1"}
+      {:atomlgfx, github: "mnishiguchi/atomlgfx", tag: "20260509"}
     ]
   end
 end

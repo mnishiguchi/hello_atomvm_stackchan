@@ -12,14 +12,17 @@ defmodule SampleApp.FaceServer do
   @default_expression :neutral
   @expression_order [:neutral, :happy, :angry, :sad, :doubt, :sleepy]
 
-  @frame_ms 50
+  @touch_ms 10
+  @frame_ms 500
+  @min_render_ms 16
   @expression_interval_ms 10_000
 
   @touch_center_x 160.0
   @touch_center_y 120.0
+  @touch_mouth_open 1.0
 
   @sample_open_options [
-    board_preset: :m5stack_core2,
+    board_preset: :m5stack_cores3,
     panel_driver: :ili9342c,
     width: 320,
     height: 240,
@@ -29,21 +32,18 @@ defmodule SampleApp.FaceServer do
     rgb_order: false,
     dlen_16bit: false,
     lcd_spi_host: :spi2_host,
-    spi_sclk_gpio: 18,
-    spi_mosi_gpio: 23,
-    spi_miso_gpio: 38,
-    lcd_cs_gpio: 5,
-    lcd_dc_gpio: 15,
+    spi_sclk_gpio: 36,
+    spi_mosi_gpio: 37,
+    spi_miso_gpio: -1,
+    lcd_cs_gpio: 3,
+    lcd_dc_gpio: 35,
     lcd_rst_gpio: -1,
     touch_driver: :ft6336u,
-    touch_i2c_port: 0,
+    touch_i2c_port: 1,
     touch_i2c_addr: 0x38,
-    touch_sda_gpio: 21,
-    touch_scl_gpio: 22,
-    touch_irq_gpio: 39,
-    lcd_spi_mode: 0,
-    lcd_bus_shared: true,
-    touch_bus_shared: true
+    touch_sda_gpio: 12,
+    touch_scl_gpio: 11,
+    touch_bus_shared: false
   ]
 
   def start_link(open_options \\ []) do
@@ -78,7 +78,8 @@ defmodule SampleApp.FaceServer do
         case initialize_face(port) do
           {:ok, face} ->
             log_info("Stack-chan started")
-            schedule_tick()
+            schedule_touch()
+            schedule_frame(0)
 
             {:ok,
              %{
@@ -86,7 +87,10 @@ defmodule SampleApp.FaceServer do
                face: face,
                expression_index: expression_index(@default_expression),
                last_expression_change_ms: monotonic_ms(),
-               remote_mouth_open: nil
+               remote_mouth_open: nil,
+               touch_active: false,
+               render_requested: false,
+               last_render_ms: 0
              }}
 
           {:error, reason} ->
@@ -97,21 +101,25 @@ defmodule SampleApp.FaceServer do
       {:error, reason} ->
         log_failure("AtomLGFX open failed", reason)
         {:stop, {:atomlgfx_open_failed, reason}}
-      end
+    end
   end
 
   @impl GenServer
   def handle_call({:set_expression, expression}, _from, state) do
     if expression in @expression_order do
+      now_ms = monotonic_ms()
       updated_face = Face.set_expression(state.face, expression)
 
-      {:reply, :ok,
-       %{
-         state
-         | face: updated_face,
-           expression_index: expression_index(expression),
-           last_expression_change_ms: monotonic_ms()
-       }}
+      next_state =
+        %{
+          state
+          | face: updated_face,
+            expression_index: expression_index(expression),
+            last_expression_change_ms: now_ms
+        }
+        |> request_render(now_ms)
+
+      {:reply, :ok, next_state}
     else
       {:reply, {:error, {:unsupported_expression, expression}}, state}
     end
@@ -119,8 +127,13 @@ defmodule SampleApp.FaceServer do
 
   def handle_call({:set_gaze, horizontal, vertical}, _from, state)
       when is_number(horizontal) and is_number(vertical) do
-    updated_face = Face.set_gaze(state.face, horizontal, vertical)
-    {:reply, :ok, %{state | face: updated_face}}
+    now_ms = monotonic_ms()
+
+    next_state =
+      %{state | face: Face.set_gaze(state.face, horizontal, vertical)}
+      |> request_render(now_ms)
+
+    {:reply, :ok, next_state}
   end
 
   def handle_call({:set_gaze, horizontal, vertical}, _from, state) do
@@ -128,9 +141,18 @@ defmodule SampleApp.FaceServer do
   end
 
   def handle_call({:set_mouth_open, ratio}, _from, state) when is_number(ratio) do
+    now_ms = monotonic_ms()
     normalized_ratio = clamp(ratio * 1.0, 0.0, 1.0)
-    updated_face = Face.set_mouth_open(state.face, normalized_ratio)
-    {:reply, :ok, %{state | face: updated_face, remote_mouth_open: normalized_ratio}}
+
+    next_state =
+      %{
+        state
+        | face: Face.set_mouth_open(state.face, normalized_ratio),
+          remote_mouth_open: normalized_ratio
+      }
+      |> request_render(now_ms)
+
+    {:reply, :ok, next_state}
   end
 
   def handle_call({:set_mouth_open, ratio}, _from, state) do
@@ -146,29 +168,35 @@ defmodule SampleApp.FaceServer do
        gaze_h: face.gaze_h,
        gaze_v: face.gaze_v,
        mouth_open: face.mouth_open,
-       remote_mouth_open: state.remote_mouth_open
+       remote_mouth_open: state.remote_mouth_open,
+       touch_active: state.touch_active
      }, state}
   end
 
   @impl GenServer
-  def handle_info(:tick, state) do
-    now_ms = monotonic_ms()
+  def handle_info(:touch_tick, state) do
+    {next_state, mouth_changed} = handle_touch(state)
+    schedule_touch()
 
-    next_state =
-      state
-      |> handle_touch()
-      |> maybe_rotate_expression(now_ms)
-      |> update_face(now_ms)
-
-    case Face.draw(next_state.face, next_state.port) do
-      :ok ->
-        schedule_tick()
-        {:noreply, next_state}
-
-      {:error, reason} ->
-        log_failure("face_draw failed", reason)
-        {:stop, {:face_draw_failed, reason}, next_state}
+    if mouth_changed do
+      draw_mouth_or_stop(next_state)
+    else
+      {:noreply, next_state}
     end
+  end
+
+  def handle_info(:frame_tick, %{touch_active: true} = state) do
+    schedule_frame(@frame_ms)
+    {:noreply, state}
+  end
+
+  def handle_info(:frame_tick, state) do
+    schedule_frame(@frame_ms)
+    render_or_stop(state, monotonic_ms())
+  end
+
+  def handle_info(:render_now, state) do
+    render_or_stop(state, monotonic_ms())
   end
 
   @impl GenServer
@@ -187,7 +215,9 @@ defmodule SampleApp.FaceServer do
         |> Face.set_expression(@default_expression)
 
       case Face.init(face0, port) do
-        {:ok, face} -> {:ok, face}
+        {:ok, face} ->
+          {:ok, face}
+
         {:error, reason} = err ->
           log_failure("face_init failed", reason)
           err
@@ -204,16 +234,67 @@ defmodule SampleApp.FaceServer do
         updated_face =
           state.face
           |> Face.set_gaze(gaze_h, gaze_v)
-          |> Face.set_mouth_open(0.7)
+          |> Face.set_mouth_open(@touch_mouth_open)
 
-        %{state | face: updated_face}
+        {%{state | face: updated_face, touch_active: true}, not state.touch_active}
 
       {:ok, :none} ->
-        %{state | face: Face.set_mouth_open(state.face, effective_mouth_open(state))}
+        updated_face = Face.set_mouth_open(state.face, effective_mouth_open(state))
+        {%{state | face: updated_face, touch_active: false}, state.touch_active}
 
       {:error, reason} ->
         log_failure("get_touch failed", reason)
+        {state, false}
+    end
+  end
+
+  defp render_or_stop(state, now_ms) do
+    if now_ms - state.last_render_ms < @min_render_ms do
+      {:noreply, %{state | render_requested: false}}
+    else
+      next_state =
         state
+        |> maybe_rotate_expression(now_ms)
+        |> update_face(now_ms)
+
+      case Face.draw(next_state.face, next_state.port) do
+        :ok ->
+          {:noreply,
+           %{
+             next_state
+             | render_requested: false,
+               last_render_ms: now_ms
+           }}
+
+        {:error, reason} ->
+          log_failure("face_draw failed", reason)
+          {:stop, {:face_draw_failed, reason}, next_state}
+      end
+    end
+  end
+
+  defp draw_mouth_or_stop(state) do
+    case Face.draw_mouth_overlay(state.face, state.port) do
+      :ok ->
+        {:noreply, state}
+
+      {:error, reason} ->
+        log_failure("mouth_overlay_draw failed", reason)
+        {:stop, {:mouth_overlay_draw_failed, reason}, state}
+    end
+  end
+
+  defp request_render(state, now_ms) do
+    cond do
+      state.render_requested ->
+        state
+
+      now_ms - state.last_render_ms < @min_render_ms ->
+        state
+
+      true ->
+        send(self(), :render_now)
+        %{state | render_requested: true}
     end
   end
 
@@ -242,8 +323,12 @@ defmodule SampleApp.FaceServer do
     %{state | face: Face.update(state.face, now_ms)}
   end
 
-  defp schedule_tick do
-    Process.send_after(self(), :tick, @frame_ms)
+  defp schedule_touch do
+    Process.send_after(self(), :touch_tick, @touch_ms)
+  end
+
+  defp schedule_frame(delay_ms) do
+    Process.send_after(self(), :frame_tick, delay_ms)
   end
 
   defp expression_index(:neutral), do: 0
